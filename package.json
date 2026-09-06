@@ -1,0 +1,23 @@
+{
+  "name": "pi-subagent-vpn",
+  "version": "0.1.0",
+  "description": "Per-subagent VPN isolation via Linux network namespaces and rotating WireGuard tunnels",
+  "keywords": [
+    "pi-package"
+  ],
+  "license": "MIT",
+  "author": "Amos Blomqvist",
+  "type": "module",
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./pi-extension/subagent-vpn/index.ts"
+    ]
+  },
+  "devDependencies": {
+    "@mariozechner/pi-coding-agent": "^0.65.0",
+    "@types/node": "^20.0.0"
+  }
+}
