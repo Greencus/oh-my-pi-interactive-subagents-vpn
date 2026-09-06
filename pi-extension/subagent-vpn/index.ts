@@ -1,12 +1,21 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { VpnManager } from "./manager.js";
+import { readAllocations, releaseNamespace } from "./tracker.js";
+import { writeFileSync, existsSync } from "node:fs";
+import { join } from "node:path";
+import { homedir } from "node:os";
 
 /**
- * Pi extension: per-subagent VPN isolation.
+ * Pi extension: per-subagent VPN isolation with optional main-agent support.
  *
  * Registers an agent spawn middleware that wraps every subagent command
  * with `ip netns exec <namespace>` so each agent runs inside its own
  * network namespace with a rotating WireGuard tunnel.
+ *
+ * When mainAgentEnabled is true, the main pi session also gets a namespace.
+ * Use `pi-vpn-launch` to generate a wrapper script that starts pi inside
+ * a namespace, or start pi directly — the extension will allocate a
+ * namespace on session_start and set PI_VPN_NAMESPACE.
  */
 
 const CONFIG_FILENAME = "config.json";
@@ -63,9 +72,40 @@ export default function subagentVpnExtension(pi: ExtensionAPI) {
         manager = null;
       }
     }
+
+    // Allocate a namespace for the main agent if enabled
+    if (manager) {
+      const sessionId =
+        process.env.PI_SESSION_ID ?? `main-${Date.now().toString(36)}`;
+      const allocation = manager.allocateMainAgent(sessionId);
+
+      if (allocation) {
+        // Set env vars so the main agent is aware of its network context
+        process.env.PI_VPN_NAMESPACE = allocation.namespace;
+        if (allocation.publicIp) {
+          process.env.PI_VPN_PUBLIC_IP = allocation.publicIp;
+        }
+        process.env.PI_AGENT_ROLE = "main";
+
+        console.log(
+          `[pi-vpn] Main agent → ${allocation.namespace}` +
+            (allocation.publicIp ? ` (${allocation.publicIp})` : ""),
+        );
+        console.log(
+          `[pi-vpn] To launch pi inside this namespace, use: pi-vpn-launch`,
+        );
+      }
+    }
   });
 
   pi.on("session_shutdown", async () => {
+    // Release main agent namespace if we allocated one
+    const mainNs = process.env.PI_VPN_NAMESPACE;
+    if (mainNs && process.env.PI_AGENT_ROLE === "main") {
+      releaseNamespace(mainNs);
+      console.log(`[pi-vpn] Released main namespace ${mainNs}`);
+    }
+
     if (manager) {
       await manager.shutdown();
       manager = null;
@@ -102,6 +142,77 @@ export default function subagentVpnExtension(pi: ExtensionAPI) {
     );
   }
 
+  // Register vpn-launch command: generates a wrapper script that starts pi
+  // inside a VPN namespace so the main session's traffic is routed through
+  // the tunnel.
+  pi.registerCommand("vpn-launch", {
+    description:
+      "Generate a launcher script that runs pi inside a VPN namespace",
+    handler: async (_args: string, ctx: any) => {
+      const agentDir =
+        process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
+      const scriptsDir = join(agentDir, "subagent-vpn", "scripts");
+
+      if (!existsSync(scriptsDir)) {
+        const fs = require("node:fs");
+        fs.mkdirSync(scriptsDir, { recursive: true });
+      }
+
+      // Find a namespace not currently in use
+      const allocations = readAllocations();
+      const usedNames = new Set(allocations.keys());
+
+      // Try to find a free namespace
+      let freeNs: string | null = null;
+      for (let i = 0; i < 256; i++) {
+        const name = `pi-vpn-${i}`;
+        if (!usedNames.has(name)) {
+          freeNs = name;
+          break;
+        }
+      }
+
+      if (!freeNs) {
+        ctx.ui.notify(
+          "All VPN namespaces are in use. Stop an existing pi session first.",
+          "warning",
+        );
+        return;
+      }
+
+      const scriptPath = join(scriptsDir, "launch-pi-vpn.sh");
+      const script = `#!/usr/bin/env bash
+# Auto-generated VPN launcher for pi
+# Namespace: ${freeNs}
+# Generated: ${new Date().toISOString()}
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Check if namespace exists
+if ! ip netns list | grep -qw "${freeNs}"; then
+  echo "[vpn-launch] Namespace ${freeNs} not found. Creating..."
+  ip netns add ${freeNs}
+fi
+
+echo "[vpn-launch] Launching pi in namespace ${freeNs}..."
+echo "[vpn-launch] Use 'vpn-status' inside pi to check VPN state."
+
+exec ip netns exec ${freeNs} pi "$@"
+`;
+
+      writeFileSync(scriptPath, script, { mode: 0o755 });
+
+      ctx.ui.notify(
+        `VPN launcher script written to:\n${scriptPath}\n\n` +
+          `Usage:\n  ${scriptPath} [pi args]\n\n` +
+          `Or run pi directly — the extension will allocate a namespace on startup.`,
+        "info",
+      );
+    },
+  });
+
   // Register status command
   pi.registerCommand("vpn-status", {
     description: "Show VPN namespace status",
@@ -117,6 +228,7 @@ export default function subagentVpnExtension(pi: ExtensionAPI) {
         return;
       }
 
+      const mainNs = process.env.PI_VPN_NAMESPACE;
       const lines = status.map((ns) => {
         const elapsed = ns.connectedAt
           ? formatElapsed(Math.floor((Date.now() - ns.connectedAt) / 1000))
@@ -125,6 +237,7 @@ export default function subagentVpnExtension(pi: ExtensionAPI) {
         const country = ns.country ?? "??";
         const busy = ns.busy ? ` → ${ns.agentId}` : "";
         const healthy = ns.healthy ? "✓" : "✗";
+        const isMain = ns.name === mainNs ? " ★" : "";
         const flag =
           country === "us"
             ? "🇺🇸"
@@ -140,7 +253,7 @@ export default function subagentVpnExtension(pi: ExtensionAPI) {
                       ? "🇬🇧"
                       : "🌐";
 
-        return `  ${flag} ${ns.name}  ${ip}  ${country.toUpperCase()}  ${elapsed}  ${healthy}${busy}`;
+        return `  ${flag} ${ns.name}${isMain}  ${ip}  ${country.toUpperCase()}  ${elapsed}  ${healthy}${busy}`;
       });
 
       ctx.ui.notify(`VPN Namespaces:\n${lines.join("\n")}`, "info");

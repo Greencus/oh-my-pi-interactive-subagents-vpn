@@ -25,6 +25,26 @@ export interface VpnConfig {
  rotateOnlyIdle: boolean;
  /** Kill switch: if WireGuard goes down, block all internet in the namespace. */
  killSwitch: boolean;
+ /** If true, allocate a namespace for the main pi agent session on startup. */
+ mainAgentEnabled: boolean;
+}
+
+/**
+ * A namespace allocation record persisted to disk for cross-instance tracking.
+ */
+export interface NamespaceAllocation {
+ /** Namespace name (e.g. pi-vpn-0). */
+ namespace: string;
+ /** The process ID that owns this allocation. */
+ pid: number;
+ /** 'main' for the pi session, 'subagent' for spawned agents. */
+ role: "main" | "subagent";
+ /** Agent name (e.g. 'orchestrator', 'worker'). */
+ agentName: string | null;
+ /** Timestamp when allocated. */
+ allocatedAt: number;
+ /** Optional human-readable session identifier. */
+ sessionId: string | null;
 }
 
 export const DEFAULT_VPN_CONFIG: VpnConfig = {
@@ -36,6 +56,7 @@ export const DEFAULT_VPN_CONFIG: VpnConfig = {
  allocation: "round-robin",
  rotateOnlyIdle: false,
  killSwitch: true,
+ mainAgentEnabled: true,
 };
 
 /**

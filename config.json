@@ -1,0 +1,11 @@
+{
+  "enabled": true,
+  "namespaceCount": 0,
+  "maxNamespaces": 8,
+  "rotationIntervalMinutes": 60,
+  "configsDirectory": "~/.pi/agent/subagent-vpn/configs",
+  "allocation": "round-robin",
+  "rotateOnlyIdle": false,
+  "killSwitch": true,
+  "mainAgentEnabled": true
+}

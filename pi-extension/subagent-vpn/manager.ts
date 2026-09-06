@@ -9,6 +9,12 @@ import {
 } from "./namespace.js";
 import { scanConfigs, bringUpWireguard } from "./wireguard.js";
 import { rotateNamespace, isTunnelHealthy } from "./rotation.js";
+import {
+  claimNamespace,
+  releaseNamespace,
+  releaseAllForCurrentProcess,
+  findAvailableIndex,
+} from "./tracker.js";
 
 /** Extract a safe error message from an unknown catch value. */
 function errMsg(err: unknown): string {
@@ -145,16 +151,45 @@ export class VpnManager {
    *
    * Returns the namespace to use, or null if VPN is disabled or capacity is reached.
    */
+  /**
+   * Allocate a namespace for the main pi agent session.
+   *
+   * This is called once at session_start. The namespace is reserved in the
+   * cross-instance lock file so no other pi instance can claim it.
+   *
+   * In dynamic mode, creates a new namespace on-demand.
+   * In fixed mode, picks from the pre-created pool.
+   */
+  allocateMainAgent(
+    sessionId: string,
+  ): { namespace: string; publicIp: string | null } | null {
+    if (!this.config.enabled || !this.config.mainAgentEnabled) return null;
+
+    if (this.isDynamic) {
+      return this.allocateDynamic("main", "main", sessionId);
+    }
+
+    return this.allocateFixed("main", "main", sessionId);
+  }
+
+  /**
+   * Allocate a namespace for a subagent.
+   *
+   * Fixed mode: picks from the pre-created pool.
+   * Dynamic mode: creates a new namespace on-demand if one isn't available.
+   *
+   * Returns the namespace to use, or null if VPN is disabled or capacity is reached.
+   */
   allocate(
     agentId: string,
   ): { namespace: string; publicIp: string | null } | null {
     if (!this.config.enabled) return null;
 
     if (this.isDynamic) {
-      return this.allocateDynamic(agentId);
+      return this.allocateDynamic(agentId, "subagent", null);
     }
 
-    return this.allocateFixed(agentId);
+    return this.allocateFixed(agentId, "subagent", null);
   }
 
   /**
@@ -162,27 +197,33 @@ export class VpnManager {
    */
   private allocateFixed(
     agentId: string,
+    role: "main" | "subagent" = "subagent",
+    sessionId: string | null = null,
   ): { namespace: string; publicIp: string | null } | null {
     const idle = Array.from(this.namespaces.values()).filter(
       (ns) => !ns.busy && ns.healthy,
     );
 
-    if (idle.length > 0) {
-      const ns = this.selectFromList(idle);
-      ns.busy = true;
-      ns.agentId = agentId;
-      return { namespace: ns.name, publicIp: ns.publicIp };
+    for (const ns of idle) {
+      const claimed = claimNamespace(ns.name, role, agentId, sessionId);
+      if (claimed) {
+        ns.busy = true;
+        ns.agentId = agentId;
+        return { namespace: ns.name, publicIp: ns.publicIp };
+      }
     }
 
     const healthy = Array.from(this.namespaces.values()).filter(
       (ns) => ns.healthy,
     );
 
-    if (healthy.length > 0) {
-      const ns = this.selectFromList(healthy);
-      ns.busy = true;
-      ns.agentId = agentId;
-      return { namespace: ns.name, publicIp: ns.publicIp };
+    for (const ns of healthy) {
+      const claimed = claimNamespace(ns.name, role, agentId, sessionId);
+      if (claimed) {
+        ns.busy = true;
+        ns.agentId = agentId;
+        return { namespace: ns.name, publicIp: ns.publicIp };
+      }
     }
 
     return null;
@@ -193,16 +234,20 @@ export class VpnManager {
    */
   private allocateDynamic(
     agentId: string,
+    role: "main" | "subagent" = "subagent",
+    sessionId: string | null = null,
   ): { namespace: string; publicIp: string | null } | null {
     const idle = Array.from(this.namespaces.values()).filter(
       (ns) => !ns.busy && ns.healthy,
     );
 
-    if (idle.length > 0) {
-      const ns = this.selectFromList(idle);
-      ns.busy = true;
-      ns.agentId = agentId;
-      return { namespace: ns.name, publicIp: ns.publicIp };
+    for (const ns of idle) {
+      const claimed = claimNamespace(ns.name, role, agentId, sessionId);
+      if (claimed) {
+        ns.busy = true;
+        ns.agentId = agentId;
+        return { namespace: ns.name, publicIp: ns.publicIp };
+      }
     }
 
     if (this.namespaces.size >= this.capacity) {
@@ -213,18 +258,28 @@ export class VpnManager {
       const all = Array.from(this.namespaces.values()).filter(
         (ns) => ns.healthy,
       );
-      if (all.length > 0) {
-        const ns = this.selectFromList(all);
-        ns.busy = true;
-        ns.agentId = agentId;
-        return { namespace: ns.name, publicIp: ns.publicIp };
+      for (const ns of all) {
+        const claimed = claimNamespace(ns.name, role, agentId, sessionId);
+        if (claimed) {
+          ns.busy = true;
+          ns.agentId = agentId;
+          return { namespace: ns.name, publicIp: ns.publicIp };
+        }
       }
       return null;
     }
 
-    const index = this.nextNamespaceIndex++;
+    // Find next available index, skipping namespaces claimed by other instances
+    const availableIndex = findAvailableIndex(this.capacity);
+    const index = availableIndex ?? this.nextNamespaceIndex++;
     const ns = this.createNamespaceSync(index);
     if (!ns) return null;
+
+    const claimed = claimNamespace(ns.name, role, agentId, sessionId);
+    if (!claimed) {
+      console.warn(`[pi-vpn] Failed to claim namespace ${ns.name}`);
+      return null;
+    }
 
     ns.busy = true;
     ns.agentId = agentId;
@@ -239,6 +294,7 @@ export class VpnManager {
       if (ns.agentId === agentId) {
         ns.busy = false;
         ns.agentId = null;
+        releaseNamespace(ns.name);
         break;
       }
     }
@@ -459,6 +515,7 @@ export class VpnManager {
       }
     }
 
+    releaseAllForCurrentProcess();
     this.namespaces.clear();
     this.initialized = false;
     console.log(`[pi-vpn] VPN manager shut down.`);
